@@ -3,7 +3,8 @@
 Cycle-Train-Cycle (CTC) London: true MVP.
 
 Usage:
-    python ctc.py "SW11 1AA" "N5 1QG"
+    python ctc.py "SW11 1AA" "N5 1BU"
+    python ctc.py "SE10 8XJ" "E20 2ST"
 
 Optional: export TFL_APP_KEY=your_key   (free from the TfL API portal)
 
