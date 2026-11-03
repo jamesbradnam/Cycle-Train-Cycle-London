@@ -3,16 +3,16 @@
 Cycle-Train-Cycle (CTC) London: true MVP.
 
 Usage:
-    python ctc.py "SW11 1AA" "N5 1BU"
-    python ctc.py "SE10 8XJ" "E20 2ST"
-
+    python ctc.py "SW11 5TN" "N1 2UN"
+    python ctc.py "SW11 5TN" "E1 1FR"
 Optional: export TFL_APP_KEY=your_key   (free from the TfL API portal)
 
 What it does:
   1. Geocodes two postcodes (postcodes.io, no key needed).
-  2. Finds the 2 nearest stations from a hard-coded list to each end.
+  2. Finds the 3 nearest stations from a hard-coded list to each end.
   3. Estimates the cycle legs from straight-line distance.
-  4. Asks the TfL Journey Planner for the train leg for each station pair.
+  4. Asks the TfL Journey Planner for the train leg for each station pair,
+     keeping only direct journeys (no train changes).
   5. Prints the fastest CTC option next to the normal TfL journey time.
 
 Everything here is deliberately crude. Cycle times are estimates,
@@ -32,12 +32,14 @@ import requests
 
 CYCLE_KMH = 15.0          # average cycling speed
 DETOUR_FACTOR = 1.3       # straight-line distance -> rough road distance
-STATION_BUFFER_MIN = 5    # locking bike, finding platform, etc.
-NEAREST_N = 2             # stations considered at each end
+STATION_BUFFER_MIN = 5    # carrying bike, finding platform, etc.
+NEAREST_N = 3             # stations considered at each end
 MAX_CYCLE_KM = 8.0        # ignore stations further than this from an end
+MAX_CHANGES = 0           # direct trains only: no changes with a bike
 
 TFL_BASE = "https://api.tfl.gov.uk"
 TFL_APP_KEY = os.environ.get("TFL_APP_KEY")
+DEBUG = os.environ.get("CTC_DEBUG")  # set CTC_DEBUG=1 to see why pairs are dropped
 
 # Modes we ask TfL to use for the train leg.
 RAIL_MODES = "overground,elizabeth-line,national-rail,dlr"
@@ -95,11 +97,55 @@ STATIONS = [
     ("Sutton", 51.3590, -0.1917),
     ("Harrow & Wealdstone", 51.5920, -0.3350),
     ("Barking", 51.5396, 0.0809),
+    # Windrush line (Highbury & Islington - New Cross / Clapham Jn / Crystal Palace / West Croydon)
+    ("Canonbury", 51.5486, -0.0924),
+    ("Dalston Junction", 51.5461, -0.0751),
+    ("Haggerston", 51.5387, -0.0757),
+    ("Hoxton", 51.5315, -0.0756),
+    ("Shoreditch High Street", 51.5233, -0.0752),
+    ("Whitechapel", 51.5195, -0.0612),
+    ("Shadwell", 51.5116, -0.0570),
+    ("Wapping", 51.5043, -0.0558),
+    ("Rotherhithe", 51.5009, -0.0520),
+    ("Surrey Quays", 51.4930, -0.0478),
+    ("New Cross Gate", 51.4755, -0.0402),
+    ("Brockley", 51.4647, -0.0376),
+    ("Honor Oak Park", 51.4504, -0.0455),
+    ("Forest Hill", 51.4392, -0.0530),
+    ("Sydenham", 51.4271, -0.0541),
+    ("Penge West", 51.4178, -0.0607),
+    ("Anerley", 51.4125, -0.0657),
+    ("Norwood Junction", 51.3971, -0.0751),
+    ("Crystal Palace", 51.4182, -0.0724),
+    ("Queens Road Peckham", 51.4736, -0.0573),
+    ("Denmark Hill", 51.4681, -0.0894),
+    ("Clapham High Street", 51.4651, -0.1327),
+    ("Wandsworth Road", 51.4699, -0.1388),
+    ("Battersea Park", 51.4778, -0.1475),
+    # Mildmay line (Stratford - Highbury & Islington - Willesden Jn - Richmond / Clapham Jn)
+    ("Hackney Wick", 51.5436, -0.0252),
+    ("Homerton", 51.5469, -0.0420),
+    ("Dalston Kingsland", 51.5483, -0.0752),
+    ("Caledonian Road & Barnsbury", 51.5483, -0.1180),
+    ("Camden Road", 51.5419, -0.1385),
+    ("Kentish Town West", 51.5465, -0.1467),
+    ("Gospel Oak", 51.5555, -0.1512),
+    ("Hampstead Heath", 51.5552, -0.1656),
+    ("Finchley Road & Frognal", 51.5500, -0.1833),
+    ("Brondesbury", 51.5450, -0.2025),
+    ("Acton Central", 51.5088, -0.2631),
+    ("Gunnersbury", 51.4915, -0.2754),
+    ("Kew Gardens", 51.4770, -0.2851),
 ]
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"[debug] {msg}", file=sys.stderr)
 
 
 def haversine_km(a, b):
@@ -134,10 +180,17 @@ def nearest_stations(point, n=NEAREST_N):
     return [s for s in ranked[:n] if s[0] <= MAX_CYCLE_KM]
 
 
-def tfl_journey(origin, destination, modes=None):
+def count_changes(journey):
+    """Number of changes: train/rail legs minus one. Walking legs don't count."""
+    rail_legs = [leg for leg in journey["legs"] if leg["mode"]["id"] not in IGNORED_MODES]
+    return max(len(rail_legs) - 1, 0)
+
+
+def tfl_journey(origin, destination, modes=None, max_changes=None):
     """
     Call the TfL Journey Planner. origin/destination are (lat, lon).
-    Returns the fastest journey dict, or None if nothing usable.
+    Returns the fastest journey dict (with at most max_changes changes
+    if set), or None if nothing usable.
     """
     frm = f"{origin[0]},{origin[1]}"
     to = f"{destination[0]},{destination[1]}"
@@ -148,9 +201,13 @@ def tfl_journey(origin, destination, modes=None):
         params["app_key"] = TFL_APP_KEY
 
     r = requests.get(f"{TFL_BASE}/Journey/JourneyResults/{frm}/to/{to}", params=params, timeout=15)
+    debug(f"TfL {frm} -> {to}: HTTP {r.status_code}")
     if r.status_code != 200:
         return None
     journeys = r.json().get("journeys", [])
+    debug(f"  {len(journeys)} journeys, changes: {[count_changes(j) for j in journeys]}")
+    if max_changes is not None:
+        journeys = [j for j in journeys if count_changes(j) <= max_changes]
     return min(journeys, key=lambda j: j["duration"]) if journeys else None
 
 
@@ -208,11 +265,13 @@ def main():
             if n1 == n2:
                 continue
 
-            journey = tfl_journey((la1, lo1), (la2, lo2), modes=RAIL_MODES)
+            journey = tfl_journey((la1, lo1), (la2, lo2), modes=RAIL_MODES, max_changes=MAX_CHANGES)
             if not journey:
+                debug(f"{n1} -> {n2}: no journey within the change limit")
                 continue
             allowed, notes = check_bike_rules(journey)
             if not allowed:
+                debug(f"{n1} -> {n2}: rejected by bike rules ({notes[0]})")
                 continue
 
             first_leg = minutes(d1, CYCLE_KMH)
@@ -224,6 +283,7 @@ def main():
                 "first": (n1, d1, first_leg),
                 "rail": describe_rail(journey),
                 "rail_min": journey["duration"],
+                "changes": count_changes(journey),
                 "last": (n2, d2, last_leg),
                 "notes": notes,
             })
@@ -242,7 +302,7 @@ def main():
         n2, d2, t2 = o["last"]
         print(f"Option {i}: about {round(o['total'])} min door to door")
         print(f"  1. Cycle ~{round(t1)} min ({d1 * DETOUR_FACTOR:.1f} km) to {n1}")
-        print(f"  2. Train: {o['rail']}, total {o['rail_min']} min (+{STATION_BUFFER_MIN} min buffer)")
+        print(f"  2. Train: {o['rail']}, total {o['rail_min']} min, {o['changes']} change(s) (+{STATION_BUFFER_MIN} min buffer)")
         print(f"  3. Cycle ~{round(t2)} min ({d2 * DETOUR_FACTOR:.1f} km) from {n2}")
         print(f"  Bike notes: {'; '.join(o['notes'])}\n")
 
